@@ -224,7 +224,9 @@ class GPT(nn.Module):
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits_flat = logits.reshape(-1, logits.size(-1))
+            targets_flat = targets.reshape(-1)
+            loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -324,6 +326,11 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
+    #curriculum hyper params
+    use_seq_len_curriculum : bool = True
+    min_seq_len : int = 128
+    max_seq_len : int = 1024 #must equal seq len
+    curriculum_steps : int = 2000 #ramp up num of iters
     num_iterations : int = 5100 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
@@ -334,6 +341,15 @@ class Hyperparameters:
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
+
+def get_curriculum_seq_len(iter_num, args):
+    #linearly incr seq_len from min_seq_len to max_seq_len
+    if not args.use_seq_len_curriculum:
+        return args.sequence_length 
+    if iter_num >= args.curriculum_steps:
+        return args.sequence_length
+    ratio = iter_num / args.curriculum_steps
+    return int(args.min_seq_len + ratio * (args.max_seq_len - args.min_seq_len))
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -370,7 +386,7 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
+# model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -479,9 +495,19 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
+        #choose curr seq len for now fixed but will update to dynamic later
+        if args.use_seq_len_curriculum:
+            L_curr = get_curriculum_seq_len(step, args) 
+        else: 
+            L_curr = args.sequence_length
+
+        #slice batch to this seq len
+        x_curr = x[:, :L_curr]
+        y_curr = y[:, :L_curr]
+
         # forward pass
         with ctx:
-            _, loss = model(x, y, return_logits=False)
+            _, loss = model(x_curr, y_curr, return_logits=False)
             train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -505,9 +531,9 @@ for step in range(args.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms seq_len:{L_curr}  step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} seq_len:{L_curr}  train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
